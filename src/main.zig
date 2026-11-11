@@ -247,7 +247,9 @@ fn fetchOnce(ctx: *const App, url: Url, response: []u8) ?usize {
         const outcome: r4os.stream_transfer.Outcome = @enumFromInt(got.outcome);
         if (outcome == .eof) eof = true;
         if (outcome != .pending and outcome != .complete and outcome != .eof and outcome != .would_block) {
-            ctx.write("HTTPGET read: failed prefix=");
+            ctx.write("HTTPGET read: ");
+            ctx.write(@tagName(outcome));
+            ctx.write(" prefix=");
             ctx.printU64(total);
             ctx.write("\r\n");
             return null;
