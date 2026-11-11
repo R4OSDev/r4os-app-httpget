@@ -27,5 +27,44 @@ ARTIFACTS_ROOT aus Settings.R4S.
 Contract:
 - Entry-Modus: `app` gemaess `module.R4MF`
 - App-Klasse: `console`
-- Platform-API-Imports: `R4SYS:Query:1`, `R4NET:Query:1`
+- Platform-API-Imports gemaess module.R4MF mit Query2:2
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\TERMINAL\HTTPGET.R4X`
+
+
+API-Migration0.90.70
+-------------------
+Das normale Modul verwendet R4XStart2 und das Generation2-SDK-Profil.
+Die geordneten Query2-Importe und die Modulversion stehen in module.R4MF.
+Der Zielpfad und die bestehende Full-Profilzuordnung folgen diesem Manifest.
+
+Die gemeinsame Argumentgrammatik prueft den gesamten UTF8-Text vor Effekten.
+Ein fuehrendes -4 beziehungsweise -6 waehlt die Adressfamilie. IPv6-Literale
+unterstuetzen den ausdruecklichen numerischen Scope fuer linklokale Ziele.
+Hostnamen verwenden standardmaessig die konfigurierte A-Resolverfolge und
+mit -6 die AAAA-Resolverfolge. DNS-Antwortseiten werden vollstaendig gelesen
+und ihre Leihe vor dem Verwenden freigegeben.
+
+network_stream.Session bindet wirkliche TCPSVC-Faehigkeiten sowie Provider,
+Socket und Generation. StreamTransfer erhaelt den bestaetigten Praefix,
+die genaue Abschlussursache und eine gemeinsame absolute Clockfrist.
+Bekanntes WouldBlock erlaubt Fortsetzung innerhalb dieser Frist. Unklare
+RPC-/Recordabschluesse beenden den Schritt mit erhaltenem bekanntem Praefix.
+Socket-Close besitzt eine getrennte begrenzte250-ms-Bereinigungsfrist.
+Fehlende Quittungen und verbleibende Socketbesitzer fuehren zum Fehlerexit.
+
+Die Ausgabe verwendet die wirklichen Start2-stdio-Bindungen. Kurze Writes
+werden innerhalb einer gemeinsamen2-s-Ausgabefrist fortgesetzt. Der defekte
+Sink beendet weitere Ausgabe und fuehrt zum Fehlerexit. Uebernommene
+Pipereferenzen werden einzeln geschlossen. Consoleausgabe behaelt ihren
+bestehenden Handoff-Vertrag. Ownerpruefungen stehen im Migrationsbeleg.
+
+HTTPGET behaelt HTTP/1.0, drei Weiterleitungen, den8-KB-Responsepuffer,
+optionales Dateispeichern und den bestehenden Statuscodeexit. Eine gemeinsame
+10-s-Frist umfasst DNS, Verbindungen, Writes, Reads und Weiterleitungen.
+Bracketierte IPv6-URLs liefern einen gueltigen Host-Header. Positive Reads
+werden bis zur bekannten Content-Length oder ausdruecklichem EOF gesammelt.
+Abgeschnittene Header, ungueltige Laengen, fehlende Koerperbytes, unterstuetzte
+Puffergrenzen und Uebertragungsfehler werden vor Dateiausgabe geprueft.
+Transfer-Encoding liefert einen ausdruecklichen Unsupported-Fehler. Der
+Weiterleitungsbau verwendet einen getrennten Zwischenpuffer. Dateiausgabe
+prueft die vollstaendige Writequittung. HTTPS bleibt die bestehende Grenze.

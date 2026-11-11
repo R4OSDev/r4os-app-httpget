@@ -1,9 +1,9 @@
+const std = @import("std");
 const r4os = @import("r4os");
 
 const MAX_TCP_PAYLOAD: usize = r4os.abi.net_service_tcp_read_max;
 const MAX_HTTP_RESPONSE: usize = 8192;
 const MAX_REDIRECT_URL: usize = 256;
-const RESPONSE_WAIT_MS: u64 = 3000;
 const REDIRECT_LIMIT: usize = 3;
 const DEFAULT_PORT: u16 = 80;
 
@@ -12,80 +12,63 @@ const Url = struct {
     host: []const u8,
     path: []const u8,
     port: u16,
-    target_ip: [4]u8,
+    target: r4os.abi.NetworkEndpoint,
     resolved: bool,
 };
 
 const App = struct {
     sys: r4os.r4sys.Context,
-    net: r4os.r4net.Context,
-
-    fn init(r4_app: *r4os.App) ?App {
-        return .{
-            .sys = r4_app.system(),
-            .net = r4_app.networkLowLevel() orelse return null,
-        };
-    }
-
-    fn argsRaw(self: *const App) [*:0]const u8 {
-        return self.sys.argsRaw();
-    }
+    output: *r4os.launch_io.Output,
+    network: *r4os.network_stream.Session,
+    budget: *r4os.rpc_budget.Budget,
+    args: []const u8,
+    family: u32,
 
     fn write(self: *const App, value: []const u8) void {
-        self.sys.write(value);
+        self.output.write(value);
     }
-
-    fn putc(self: *const App, ch: u8) void {
-        self.sys.putc(ch);
-    }
-
     fn printU64(self: *const App, value: u64) void {
-        self.sys.printU64(value);
-    }
-
-    fn ticksFromMilliseconds(self: *const App, ms: u64) u64 {
-        return self.sys.ticksFromMilliseconds(ms);
-    }
-
-    fn fileWrite(self: *const App, path: [*:0]const u8, data: []const u8) i32 {
-        return self.sys.fileWrite(path, data);
-    }
-
-    fn netDnsResolveService(self: *const App, name_value: []const u8, out: *[4]u8) i32 {
-        return self.net.netDnsResolveService(name_value, out);
-    }
-
-    fn netDnsResultName(self: *const App, result: i32) []const u8 {
-        return self.net.netDnsResultName(result);
-    }
-
-    fn tcpConnectService(self: *const App, a: u8, b: u8, c: u8, d: u8, port: u16) i32 {
-        return self.net.tcpConnectService(a, b, c, d, port);
-    }
-
-    fn tcpWriteService(self: *const App, handle: u32, data: []const u8) i32 {
-        return self.net.tcpWriteService(handle, data);
-    }
-
-    fn tcpReadAvailableWaitService(self: *const App, handle: u32, out: []u8, wait_ticks: u64) i32 {
-        return self.net.tcpReadAvailableWaitService(handle, out, wait_ticks);
-    }
-
-    fn tcpCloseService(self: *const App, handle: u32) i32 {
-        return self.net.tcpCloseService(handle);
+        self.output.number(value);
     }
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
-    const ctx = App.init(r4_app) orelse return r4os.abi.err_no_group;
-    const args = trim(zSlice(ctx.argsRaw()));
+pub fn r4_app_main(app: *r4os.App2) i32 {
+    var output: r4os.launch_io.Output = undefined;
+    if (r4os.launch_io.Output.init(app, &output) != 0) return 1;
+    var selected_family: u32 = 0;
+    const args = r4os.network_stream.arguments(app.args(), &selected_family) orelse {
+        output.write("HTTPGET: invalid argument grammar\r\n");
+        _ = output.close();
+        return 1;
+    };
+    var budget = r4os.rpc_budget.Budget.fromTimeout(output.clock.read, .{ .kind = 1, .nanoseconds = 10_000_000_000 }) catch {
+        _ = output.close();
+        return 1;
+    };
+    var network: r4os.network_stream.Session = undefined;
+    const opened = r4os.network_stream.Session.open(app, &budget, &network);
+    if (opened != 0) {
+        output.write("HTTPGET: TCPSVC unavailable or invalid\r\n");
+        _ = output.close();
+        return 1;
+    }
+    const ctx: App = .{ .sys = app.system(), .output = &output, .network = &network, .budget = &budget, .args = args, .family = selected_family };
+    const result = run(&ctx);
+    const closed = network.close();
+    if (closed != 0) output.write("HTTPGET close: not confirmed\r\n");
+    const io_closed = output.close();
+    return if (output.failed or closed != 0 or io_closed != 0) 1 else result;
+}
+
+fn run(ctx: *const App) i32 {
+    const args = trim(ctx.args);
     const first = takeToken(args) orelse {
-        usage(&ctx);
+        usage(ctx);
         return 1;
     };
     const outfile_token = takeToken(first.rest);
     if (outfile_token != null and outfile_token.?.rest.len != 0) {
-        usage(&ctx);
+        usage(ctx);
         return 1;
     }
 
@@ -95,21 +78,21 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     var redirects: usize = 0;
 
     while (true) {
-        const url = parseUrl(&ctx, current_url) orelse {
-            usage(&ctx);
+        const url = parseUrl(ctx, current_url) orelse {
+            usage(ctx);
             return 1;
         };
         if (url.resolved) {
             ctx.write("HTTPGET resolved ");
             ctx.write(url.host);
             ctx.write(" to ");
-            writeIpv4(&ctx, url.target_ip);
+            writeAddress(ctx, url.target.address);
             ctx.write("\r\n");
         }
 
-        const total = fetchOnce(&ctx, url, response[0..]) orelse return 1;
+        const total = fetchOnce(ctx, url, response[0..]) orelse return 1;
         const response_bytes = response[0..total];
-        printStatus(&ctx, response_bytes);
+        printStatus(ctx, response_bytes);
         const code = statusCode(response_bytes);
 
         if (isRedirectStatus(code)) {
@@ -121,10 +104,13 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
                 ctx.write("HTTPGET redirect: missing-location\r\n");
                 return 1;
             };
-            current_url = resolveRedirectUrl(url, trim(location), redirect_buf[0..]) orelse {
+            var next_url: [MAX_REDIRECT_URL]u8 = undefined;
+            const redirected = resolveRedirectUrl(url, trim(location), &next_url) orelse {
                 ctx.write("HTTPGET redirect: unsupported-location\r\n");
                 return 1;
             };
+            @memcpy(redirect_buf[0..redirected.len], redirected);
+            current_url = redirect_buf[0..redirected.len];
             redirects += 1;
             ctx.write("HTTPGET redirect: ");
             ctx.write(current_url);
@@ -146,9 +132,14 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
                 ctx.write("HTTPGET save: path-too-long\r\n");
                 return 1;
             };
-            const saved = ctx.fileWrite(out_path, body);
+            const files = r4os.Files{ .sys = ctx.sys };
+            const saved: i32 = switch (files.write(.{ .ptr = out_path, .len = @intCast(out_tok.token.len) }, body)) {
+                .bytes => |count| @intCast(count),
+                .end => 0,
+                .failure => |code_value| code_value,
+            };
             ctx.write("HTTPGET saved: ");
-            if (saved >= 0) {
+            if (saved >= 0 and saved == body.len) {
                 ctx.printU64(@intCast(saved));
                 ctx.write(" bytes to ");
                 ctx.write(out_tok.token);
@@ -164,7 +155,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
 }
 
 fn usage(ctx: *const App) void {
-    ctx.write("Usage: HTTPGET http://host[:port]/path [outfile]\r\n");
+    ctx.write("Usage: HTTPGET [-4|-6] http://host[:port]/path [outfile]\r\n");
 }
 
 fn parseUrl(ctx: *const App, raw: []const u8) ?Url {
@@ -181,37 +172,28 @@ fn parseUrl(ctx: *const App, raw: []const u8) ?Url {
 
     var host = host_port;
     var port: u16 = DEFAULT_PORT;
-    if (indexOfByte(host_port, ':')) |colon| {
+    if (host_port[0] == '[') {
+        const close = indexOfByte(host_port, ']') orelse return null;
+        host = host_port[0 .. close + 1];
+        if (close + 1 < host_port.len) {
+            if (host_port[close + 1] != ':') return null;
+            port = parsePort(host_port[close + 2 ..]) orelse return null;
+        }
+    } else if (indexOfByte(host_port, ':')) |colon| {
         host = host_port[0..colon];
         port = parsePort(host_port[colon + 1 ..]) orelse return null;
     }
-    if (host.len == 0) return null;
-
-    var target_ip: [4]u8 = undefined;
-    var resolved = false;
-    if (parseIpv4(host)) |ip| {
-        target_ip = ip;
-    } else {
-        const result = ctx.netDnsResolveService(host, &target_ip);
-        if (result != r4os.abi.dns_result_ok) {
-            ctx.write("HTTPGET resolve failed for ");
-            ctx.write(host);
-            ctx.write(": ");
-            ctx.write(ctx.netDnsResultName(result));
-            ctx.write("\r\n");
-            return null;
-        }
-        resolved = true;
+    if (host.len == 0 or std.mem.indexOfAny(u8, host, " \t\r\n@") != null) return null;
+    var target: r4os.abi.NetworkEndpoint = .{};
+    const rc = ctx.network.resolve(host, port, ctx.family, ctx.budget, &target);
+    if (rc != 0) {
+        ctx.write("HTTPGET resolve failed for ");
+        ctx.write(host);
+        ctx.write("\r\n");
+        return null;
     }
-
-    return .{
-        .original = raw,
-        .host = host,
-        .path = path,
-        .port = port,
-        .target_ip = target_ip,
-        .resolved = resolved,
-    };
+    const numeric = if (host[0] == '[') host[1 .. host.len - 1] else host;
+    return .{ .original = raw, .host = host, .path = path, .port = port, .target = target, .resolved = r4os.network_family.parseAddress(numeric) == null };
 }
 
 fn buildRequest(out: []u8, url: Url) ?[]const u8 {
@@ -230,69 +212,71 @@ fn buildRequest(out: []u8, url: Url) ?[]const u8 {
 
 fn fetchOnce(ctx: *const App, url: Url, response: []u8) ?usize {
     var request_buf: [MAX_TCP_PAYLOAD]u8 = undefined;
-    const request = buildRequest(request_buf[0..], url) orelse {
+    const request = buildRequest(&request_buf, url) orelse {
         ctx.write("HTTPGET: request too large\r\n");
         return null;
     };
-
     ctx.write("HTTPGET connect ");
-    writeIpv4(ctx, url.target_ip);
+    writeAddress(ctx, url.target.address);
     ctx.write(":");
     ctx.printU64(url.port);
     ctx.write(": ");
-    const conn = ctx.tcpConnectService(url.target_ip[0], url.target_ip[1], url.target_ip[2], url.target_ip[3], url.port);
-    if (conn <= 0) {
+    var socket: r4os.network_stream.Socket = undefined;
+    if (ctx.network.create(url.target, false, ctx.budget, &socket) != 0) {
         ctx.write("failed\r\n");
         return null;
     }
+    defer socket.close();
     ctx.write("ok\r\n");
-
-    const conn_id: u32 = @intCast(conn);
-    const written = ctx.tcpWriteService(conn_id, request);
-    if (written < 0 or written != @as(i32, @intCast(request.len))) {
-        ctx.write("HTTPGET write: failed\r\n");
-        _ = ctx.tcpCloseService(conn_id);
+    const written = socket.writeAll(request, ctx.budget) catch return null;
+    if (!r4os.network_stream.complete(written)) {
+        ctx.write("HTTPGET write: failed prefix=");
+        ctx.printU64(written.bytes);
+        ctx.write("\r\n");
         return null;
     }
     ctx.write("HTTPGET sent: ");
-    ctx.printU64(@intCast(written));
+    ctx.printU64(written.bytes);
     ctx.write("\r\n");
-
+    var reader: r4os.network_stream.Reader = .{ .socket = &socket };
     var total: usize = 0;
-    var read_buf: [MAX_TCP_PAYLOAD * 4]u8 = undefined;
-    const response_wait_ticks = ctx.ticksFromMilliseconds(RESPONSE_WAIT_MS);
+    var eof = false;
     while (total < response.len) {
-        const read_cap = @min(read_buf.len, response.len - total);
-        const got = ctx.tcpReadAvailableWaitService(conn_id, read_buf[0..read_cap], response_wait_ticks);
-        if (got <= 0) break;
-        const got_len: usize = @intCast(got);
-        if (total + got_len > response.len) {
-            ctx.write("HTTPGET response: too-large\r\n");
-            _ = ctx.tcpCloseService(conn_id);
+        const got = reader.read(response[total..], false, ctx.budget) catch return null;
+        total += @intCast(got.bytes);
+        const outcome: r4os.stream_transfer.Outcome = @enumFromInt(got.outcome);
+        if (outcome == .eof) eof = true;
+        if (outcome != .pending and outcome != .complete and outcome != .eof and outcome != .would_block) {
+            ctx.write("HTTPGET read: failed prefix=");
+            ctx.printU64(total);
+            ctx.write("\r\n");
             return null;
         }
-        @memcpy(response[total .. total + got_len], read_buf[0..got_len]);
-        total += got_len;
-        if (responseComplete(response[0..total])) break;
+        if (responseComplete(response[0..total]) or eof) break;
     }
-    _ = ctx.tcpCloseService(conn_id);
-
-    if (total == 0) {
-        ctx.write("HTTPGET read: timeout\r\n");
+    const received = response[0..total];
+    if (headerEnd(received) == null or statusCode(received) == null) {
+        ctx.write("HTTPGET response: incomplete\r\n");
         return null;
     }
-    if (!responseComplete(response[0..total]) and total == response.len) {
+    if (responseHeader(received, "Transfer-Encoding") != null) {
+        ctx.write("HTTPGET response: unsupported transfer encoding\r\n");
+        return null;
+    }
+    if (responseHeader(received, "Content-Length") != null and contentLength(received) == null) {
+        ctx.write("HTTPGET response: invalid content length\r\n");
+        return null;
+    }
+    if (!responseComplete(received) and !eof) {
         ctx.write("HTTPGET response: too-large\r\n");
         return null;
     }
-    if (contentLength(response[0..total])) |expected| {
-        const body = responseBody(response[0..total]);
-        if (body.len < expected) {
+    if (contentLength(received)) |expected| {
+        if (responseBody(received).len < expected) {
             ctx.write("HTTPGET response: incomplete\r\n");
             return null;
         }
     }
-
     ctx.write("HTTPGET received: ");
     ctx.printU64(total);
     ctx.write("\r\n");
@@ -439,91 +423,38 @@ fn appendPort(out: []u8, len: *usize, port: u16) bool {
     return append(out, len, digits[digits.len - count ..]);
 }
 
-const Token = struct {
-    token: []const u8,
-    rest: []const u8,
-};
-
+const Token = struct { token: []const u8, rest: []const u8 };
 fn takeToken(value: []const u8) ?Token {
-    const trimmed = trim(value);
-    if (trimmed.len == 0) return null;
-    var end: usize = 0;
-    while (end < trimmed.len and !isSpace(trimmed[end])) : (end += 1) {}
-    return .{
-        .token = trimmed[0..end],
-        .rest = if (end >= trimmed.len) "" else trim(trimmed[end..]),
-    };
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = r4os.arguments.ArgCursor.init(value, .{}, &failure) catch return null;
+    const token = (cursor.next() catch return null) orelse return null;
+    return .{ .token = token.bytes(value) catch return null, .rest = cursor.remainingArguments() catch return null };
 }
 
 fn parsePort(value: []const u8) ?u16 {
     if (value.len == 0) return null;
-    var out: u32 = 0;
-    for (value) |ch| {
-        if (ch < '0' or ch > '9') return null;
-        out = out * 10 + @as(u32, ch - '0');
-        if (out == 0 or out > 65535) return null;
-    }
-    return @intCast(out);
+    for (value) |byte| if (byte < '0' or byte > '9') return null;
+    const number = std.fmt.parseInt(u16, value, 10) catch return null;
+    return if (number == 0) null else number;
 }
 
 fn parseU16(value: []const u8) ?u16 {
     if (value.len == 0) return null;
-    var out: u32 = 0;
-    for (value) |ch| {
-        if (ch < '0' or ch > '9') return null;
-        out = out * 10 + @as(u32, ch - '0');
-        if (out > 65535) return null;
-    }
-    return @intCast(out);
+    for (value) |byte| if (byte < '0' or byte > '9') return null;
+    const number = std.fmt.parseInt(u16, value, 10) catch return null;
+    return number;
 }
 
 fn parseUsize(value: []const u8) ?usize {
     if (value.len == 0) return null;
-    var out: usize = 0;
-    for (value) |ch| {
-        if (ch < '0' or ch > '9') return null;
-        out = out * 10 + @as(usize, ch - '0');
-    }
-    return out;
+    for (value) |byte| if (byte < '0' or byte > '9') return null;
+    const number = std.fmt.parseInt(usize, value, 10) catch return null;
+    return number;
 }
 
-fn parseIpv4(value: []const u8) ?[4]u8 {
-    var out: [4]u8 = .{0} ** 4;
-    var part: usize = 0;
-    var accum: u16 = 0;
-    var digits: usize = 0;
-
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        const ch = value[index];
-        if (ch >= '0' and ch <= '9') {
-            accum = accum * 10 + @as(u16, ch - '0');
-            if (accum > 255) return null;
-            digits += 1;
-            if (digits > 3) return null;
-        } else if (ch == '.') {
-            if (digits == 0 or part >= 3) return null;
-            out[part] = @intCast(accum);
-            part += 1;
-            accum = 0;
-            digits = 0;
-        } else {
-            return null;
-        }
-    }
-    if (digits == 0 or part != 3) return null;
-    out[part] = @intCast(accum);
-    return out;
-}
-
-fn writeIpv4(ctx: *const App, ip: [4]u8) void {
-    ctx.printU64(ip[0]);
-    ctx.putc('.');
-    ctx.printU64(ip[1]);
-    ctx.putc('.');
-    ctx.printU64(ip[2]);
-    ctx.putc('.');
-    ctx.printU64(ip[3]);
+fn writeAddress(ctx: *const App, address: r4os.abi.NetworkAddress) void {
+    var buffer: [80]u8 = undefined;
+    ctx.write(r4os.network_family.addressText(&buffer, address) catch "unknown");
 }
 
 fn copyZ(out: [:0]u8, text: []const u8) ?[*:0]const u8 {
@@ -595,4 +526,16 @@ fn trim(value: []const u8) []const u8 {
 
 fn isSpace(ch: u8) bool {
     return ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n';
+}
+
+test "migration HTTP distinguishes known length completion EOF and invalid lengths" {
+    const short = "HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\nabc";
+    try std.testing.expect(!responseComplete(short));
+    try std.testing.expectEqual(@as(usize, 9), contentLength(short).?);
+    const full = "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+    try std.testing.expect(responseComplete(full));
+    try std.testing.expectEqualStrings("abc", responseBodyLimited(full));
+    try std.testing.expect(contentLength("HTTP/1.0 200 OK\r\nContent-Length: 9999999999999999999999999999999\r\n\r\n") == null);
+    try std.testing.expect(parsePort("65536") == null);
+    try std.testing.expect(parsePort("0") == null);
 }
